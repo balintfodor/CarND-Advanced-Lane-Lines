@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
+from scipy.optimize import least_squares
 from consecution import Pipeline, Node, GroupByNode
 import glob
+import copy
 from tqdm import tqdm
 
 class ImageLog(Node):
@@ -32,15 +34,16 @@ class Undistort(Node):
         self.push((im_id, und))
 
 
-class SaturationThreshold(Node):
-    def __init__(self, name, threshold):
+class ColorThreshold(Node):
+    def __init__(self, name, sat_th, val_th):
         super().__init__(name)
-        self.th = threshold
+        self.sat_th = sat_th
+        self.val_th = val_th
 
     def process(self, item):
         im_id, image = item
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        bin_image = hsv[:, :, 1] >= self.th
+        bin_image = (hsv[:, :, 1] >= self.sat_th) * (hsv[:, :, 2] >= self.val_th)
         out = (bin_image * 255).astype(np.uint8)
         self.push((im_id, out))
 
@@ -85,6 +88,78 @@ class MaxMerger(GroupByNode):
         self.push((batch[0][0], out))
 
 
+class PerspectiveWarp(Node):
+    def __init__(self, name, src_points, dst_points, src_size, dst_size):
+        super().__init__(name)
+        self.src_pts = np.array(src_points, dtype=np.float32)
+        self.dst_pts = np.array(dst_points, dtype=np.float32)
+        self.matrix = cv2.getPerspectiveTransform(self.src_pts, self.dst_pts)
+        self.dst_size = tuple(dst_size)
+        self.src_size = tuple(src_size)
+        self.inverse = False
+
+    def process(self, item):
+        im_id, image = item
+        if self.inverse:
+            out = cv2.warpPerspective(image, self.matrix, self.src_size, flags=cv2.WARP_INVERSE_MAP)
+        else:
+            out = cv2.warpPerspective(image, self.matrix, self.dst_size)
+        self.push((im_id, out))
+
+class LaneDetector(Node):
+    def __init__(self, name, win_height=32):
+        super().__init__(name)
+        self.win_height = win_height
+
+    def analyze_win(self, im):
+        vert_sum = np.sum(im, axis=0)
+        x = np.argmax(vert_sum)
+        return x
+
+    def robust_fit_poly(self, points):
+        points = np.array(points)
+
+        def f(p, x, y):
+            return p[0] * x*x + p[1] * x + p[2] - y
+        
+        p0 = np.array([1, 1, 1])
+        res = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
+            args=(points[:, 1], points[:, 0]))
+        return res.x
+
+    def draw_poly(self, im, p, xs):
+        x = xs[0]
+        y = p[0] * x*x + p[1] * x + p[2]
+        for x_new in xs[1:]:
+            y_new = p[0] * x*x + p[1] * x + p[2]
+            cv2.line(im, (int(y), int(x)), (int(y_new), int(x_new)), (255,))
+            y = y_new
+            x = x_new
+
+    def process(self, item):
+        im_id, image = item
+        wh = self.win_height
+        half = image.shape[1] // 2
+        overlap_param = 4
+        step = wh // overlap_param
+
+        out = np.copy(image) // 2
+
+        h_samples = range(255 - wh, 0, -step)
+
+        for side_offset in [0, half]:
+            points = []
+            for y_pos in h_samples:
+                roi = image[y_pos:(y_pos + wh), side_offset:(side_offset + half)]
+                x = self.analyze_win(roi) + side_offset
+                y = y_pos + wh / 2
+                points.append((x, y))
+                cv2.circle(out, (int(x), int(y)), 2, (255,))
+            poly = self.robust_fit_poly(points)
+            self.draw_poly(out, poly, np.array(h_samples) + wh / 2)
+        self.push((im_id, out))
+
+
 def collect_images(folder):
     images = []
     for format in ['jpg', 'png', 'tif']:
@@ -98,16 +173,31 @@ def image_loader(images):
 
 def main():
     calib_file = 'debug/calibration.npz'
-    input_dir = 'test_images'
-
     calib = np.load(calib_file)
+
+    input_dir = 'test_images'
+    persp_src_points = [[137.9, 719], [558.3, 426.7], [674.9, 426.7], [1140.2, 719]]
+    persp_dst_points = [[137.9/1280*256, 255], [137.9/1280*256, 0], [1140.2/1280*256, 0], [1140.2/1280*256, 255]]
+    persp_dst_size = [256, 256]
+
+    forward_warp = PerspectiveWarp('perspective_warp', 
+        persp_src_points, 
+        persp_dst_points, 
+        calib['image_size'], 
+        persp_dst_size)
+    backward_warp = copy.deepcopy(forward_warp)
+    backward_warp.name = 'perspective_back_warp'
+    backward_warp.inverse = True
 
     pipe = Pipeline(ImageLog('original', 'output_images')
         | Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size']) | ImageLog('undistorted', 'output_images')
         | [
-            SaturationThreshold('saturation_threshold', 150) | ImageLog('saturation_threshold_log', 'output_images'),
+            ColorThreshold('color_threshold', 80, 200) | ImageLog('color_threshold_log', 'output_images'),
             GradientThreshold('gradient_threshold', [50, 250], [0.3, 0.9]) | ImageLog('gradient_threshold_log', 'output_images')]
         | MaxMerger('max_merger') | ImageLog('max_merger_out', 'output_images')
+        | forward_warp | ImageLog('perspective_warp_out', 'output_images')
+        | LaneDetector('lane_detector_rough') | ImageLog('lane_detector_out', 'output_images')
+        | backward_warp | ImageLog('perspective_back_warp_out', 'output_images')
     )
 
     print(pipe)
