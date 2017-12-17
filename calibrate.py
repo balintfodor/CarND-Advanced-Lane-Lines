@@ -94,7 +94,8 @@ def main():
     calib_out_file = 'calibration.npz'
     np.savez('{}/{}'.format(args.output_folder, calib_out_file),
         camera_matrix=calib_data['camera_matrix'],
-        distortion_coefs=calib_data['distortion'])
+        distortion_coefs=calib_data['distortion'],
+        image_size=detected['im_size'])
     print('calibration saved to {}/{}'.format(args.output_folder, calib_out_file))
 
 if __name__ == "__main__":
