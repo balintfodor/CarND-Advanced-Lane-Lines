@@ -6,6 +6,11 @@ import glob
 import copy
 from tqdm import tqdm
 
+class Bypass(Node):
+    def process(self, item):
+        self.push(item)
+
+
 class ImageLog(Node):
     def __init__(self, name, base_dir):
         super().__init__(name)
@@ -85,13 +90,20 @@ class GradientThreshold(Node):
         self.push(item)
 
 
-class MaxMerger(GroupByNode):
+class Merger(GroupByNode):
+    def __init__(self, name, method='max'):
+        super().__init__(name)
+        self.method = method
+
     def key(self, item):
         return item['id']
 
     def process(self, batch):
         images = [item['image'] for item in batch]
-        out = np.max(np.array(images), axis=0)
+        if self.method == 'max':
+            out = np.max(np.array(images), axis=0)
+        else:
+            out = np.sum(np.array(images), axis=0)
         self.push({'id': batch[0]['id'], 'image': out})
 
 
@@ -125,8 +137,14 @@ class LaneDetector(Node):
         self.use_argmax = use_argmax_for_center_detect
         self.overlap_param = int(overlap_param)
 
-    def analyze_win(self, im):
+    def analyze_win(self, im, last_x):
         vert_sum = np.sum(im, axis=0)
+        if last_x is not None:
+            mask = np.zeros_like(vert_sum)
+            b = np.maximum(0, int(last_x)-16)
+            e = np.minimum(im.shape[1]-1, int(last_x)+16)
+            mask[b:e] = 1
+            vert_sum *= mask
         s = np.sum(vert_sum)
         if s < self.win_height * 2 * 255:
             return None
@@ -139,16 +157,23 @@ class LaneDetector(Node):
             x = np.sum(idx * val)
         return x
 
-    def robust_fit_poly(self, points):
-        points = np.array(points)
+    def robust_poly_pair_fit(self, points1, points2):
+        points1 = np.array(points1)
+        points2 = np.array(points2)
+        # points = np.vstack((points1, points2))
 
         def f(p, x, y):
-            return quadratic(p, x) - y
+            e1 = quadratic(p[[0, 1, 2]], x) - y
+            return e1
         
         p0 = np.array([1, 1, 1])
-        res = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
-            args=(points[:, 0], points[:, 1]))
-        return res.x
+        res1 = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
+            args=(points1[:, 0], points1[:, 1]))
+
+        res2 = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
+            args=(points2[:, 0], points2[:, 1]))
+
+        return ([res1.x[0], res1.x[1], res1.x[2]], [res2.x[0], res2.x[1], res2.x[2]])
 
     def process(self, item):
         item = copy.deepcopy(item)
@@ -162,15 +187,17 @@ class LaneDetector(Node):
         lane_points = [None, None]
         for k, side_offset in enumerate([0, half]):
             points = []
+            last_x = None
             for y_pos in h_samples:
                 roi = image[y_pos:(y_pos + wh), side_offset:(side_offset + half)]
-                x = self.analyze_win(roi)
+                x = self.analyze_win(roi, last_x)
                 if x is not None:
                     y = y_pos + wh / 2
                     points.append((y, x + side_offset))
-            poly = self.robust_fit_poly(points)
-            lanes[k] = poly
+                    last_x = x
             lane_points[k] = points
+
+        lanes = self.robust_poly_pair_fit(lane_points[0], lane_points[1])
 
         item['lanes'] = lanes
         item['lane_points'] = lane_points
@@ -228,6 +255,53 @@ class MaskWithPoly(Node):
         self.push(item)
 
 
+class LanePainter(Node):
+    def process(self, item):
+        item = copy.deepcopy(item)
+        im_id, image, lanes = item['id'], item['image'], item['lanes']
+        out = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.uint8)
+        self.draw_lane(out, lanes[0], lanes[1])
+        item['image'] = out
+        self.push(item)
+    
+    def draw_lane(self, im, p1, p2):
+        points = [(quadratic(p1, y), y) for y in range(im.shape[0])]
+        points.extend([(quadratic(p2, y), y) for y in reversed(range(im.shape[0]))])
+        pts = np.array(points, dtype=np.int32)
+        cv2.fillPoly(im, [pts], (0, 64, 0))
+
+class InfoPainter(Node):
+    def __init__(self, name, lane_width_in_pixels, lane_width_in_m=3.7):
+        super().__init__(name)
+        self.width_p2m = lane_width_in_m / lane_width_in_pixels
+
+    def process(self, item):
+        item = copy.deepcopy(item)
+        im_id, image, lanes = item['id'], item['image'], item['lanes']
+        sz = [256, 256]
+        offset = self.car_offset(sz, lanes) * self.width_p2m
+        r = np.mean([
+            self.curv_radius(
+                lanes[np.random.randint(2)], 
+                np.random.rand()*(sz[0]-1)) for _ in range(100)
+            ])
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(image,
+            'offset = {:0.2f} m, curvature radius = {:0.2f} m'.format(offset, r),
+            (10, 50), font, 1, (255, 255, 255), 2)
+
+        item['image'] = image
+        self.push(item)
+    
+    def car_offset(self, im_size, lanes):
+        x1 = quadratic(lanes[0], im_size[0]-1)
+        x2 = quadratic(lanes[1], im_size[0]-1)
+        c = 0.5 * (x1 + x2)
+        return c - im_size[1] / 2
+
+    def curv_radius(self, p, h):
+        return np.power(1 + np.square(2 * p[0] * h + p[1]), 3/2) / np.abs(2 * p[0])
+
 def collect_images(folder):
     images = []
     for format in ['jpg', 'png', 'tif']:
@@ -240,13 +314,23 @@ def image_loader(images):
         item = {'id': i, 'image': im}
         yield item
 
+def video_loader(video_file):
+    cap = cv2.VideoCapture(video_file)
+    i = 0
+    while(cap.isOpened()):
+        ret, frame = cap.read()
+        item = {'id': i, 'image': frame}
+        i += 1
+        yield item
+
 def main():
     calib_file = 'debug/calibration.npz'
     calib = np.load(calib_file)
 
     input_dir = 'test_images'
     persp_src_points = [[137.9, 719], [558.3, 426.7], [674.9, 426.7], [1140.2, 719]]
-    persp_dst_points = [[137.9/1280*256, 255], [137.9/1280*256, 0], [1140.2/1280*256, 0], [1140.2/1280*256, 255]]
+    persp_dst_points = [[137.9/1280*256, 265], [137.9/1280*256, 0], [1140.2/1280*256, 0], [1140.2/1280*256, 265]]
+    # persp_dst_points = [[10, 265], [10, 0], [245, 0], [245, 265]]
     persp_dst_size = [256, 256]
 
     forward_warp = PerspectiveWarp('perspective_warp', 
@@ -259,26 +343,56 @@ def main():
     backward_warp.inverse = True
 
     rough_lane_detector = LaneDetector('lane_detector_rough')
-    finer_lane_detector = LaneDetector('lane_detector_finer',
-        win_height=16, overlap_param=2, use_argmax_for_center_detect=False)
+    finer_lane_detector = LaneDetector('lane_detector_finer', use_argmax_for_center_detect=False)
 
     pipe = Pipeline(ImageLog('original', 'output_images')
         | Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size']) | ImageLog('undistorted', 'output_images')
         | [
-            ColorThreshold('color_threshold', 80, 200) | ImageLog('color_threshold_log', 'output_images'),
-            GradientThreshold('gradient_threshold', [50, 250], [0.3, 0.9]) | ImageLog('gradient_threshold_log', 'output_images')]
-        | MaxMerger('max_merger') | ImageLog('max_merger_out', 'output_images')
-        | forward_warp | ImageLog('perspective_warp_out', 'output_images')
-        | rough_lane_detector | PolyImageLog('poly_log', 'output_images')
-        | MaskWithPoly('mask_with_poly') | ImageLog('mask_with_poly_out', 'output_images')
-        | finer_lane_detector | PolyImageLog('poly_refined_log', 'output_images')
-        | backward_warp | ImageLog('perspective_back_warp_out', 'output_images')
+            [
+                ColorThreshold('color_threshold', 80, 200) | ImageLog('color_threshold_log', 'output_images'),
+                GradientThreshold('gradient_threshold', [15, 250], [0.3, 0.9]) | ImageLog('gradient_threshold_log', 'output_images')
+            ]
+            | Merger('max_merger', 'max') | ImageLog('max_merger_out', 'output_images')
+            | forward_warp | ImageLog('perspective_warp_out', 'output_images')
+            | rough_lane_detector | PolyImageLog('poly_log', 'output_images')
+            | MaskWithPoly('mask_with_poly') | ImageLog('mask_with_poly_out', 'output_images')
+            | finer_lane_detector | PolyImageLog('poly_refined_log', 'output_images')
+            | LanePainter('lane_painter') | PolyImageLog('lane_painter_log', 'output_images')
+            | backward_warp | ImageLog('perspective_back_warp_out', 'output_images')
+            | InfoPainter('info_painter', 188) | ImageLog('info_painter_out', 'output_images')
+            ,
+            Bypass('undist_bypass')
+        ]
+        | Merger('add_merger', 'add') | ImageLog('final_image', 'output_images')
     )
+
+    # pipe = Pipeline(
+    #     Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size'])
+    #     | [
+    #         [
+    #             ColorThreshold('color_threshold', 80, 200),
+    #             GradientThreshold('gradient_threshold', [50, 250], [0.3, 0.9])
+    #         ]
+    #         | Merger('max_merger', 'max')
+    #         | forward_warp
+    #         | rough_lane_detector
+    #         | MaskWithPoly('mask_with_poly')
+    #         | finer_lane_detector
+    #         | LanePainter('lane_painter')
+    #         | backward_warp
+    #         | InfoPainter('info_painter', 188)
+    #         ,
+    #         Bypass('undist_bypass')
+    #     ]
+    #     | Merger('add_merger', 'add') | ImageLog('final_image', 'output_images')
+    # )
 
     print(pipe)
 
-    images = collect_images(input_dir)
-    pipe.consume(tqdm(image_loader(images), total=len(images)))
+    # images = collect_images(input_dir)
+    # pipe.consume(tqdm(image_loader(images), total=len(images)))
+
+    pipe.consume(tqdm(video_loader('challenge_video.mp4')))
 
 if __name__ == "__main__":
     main()
