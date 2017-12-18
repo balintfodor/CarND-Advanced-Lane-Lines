@@ -2,9 +2,10 @@ import cv2
 import numpy as np
 from scipy.optimize import least_squares
 from consecution import Pipeline, Node, GroupByNode
-import glob
-import copy
+import glob, sys, copy
+from sklearn.svm import LinearSVC, SVC
 from tqdm import tqdm
+from skimage.exposure import equalize_adapthist
 
 class Bypass(Node):
     def process(self, item):
@@ -51,15 +52,36 @@ class ColorThreshold(Node):
     def process(self, item):
         item = copy.deepcopy(item)
         im_id, image = item['id'], item['image']
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        bin_image = (hsv[:, :, 1] >= self.sat_th) * (hsv[:, :, 2] >= self.val_th)
-        out = (bin_image * 255).astype(np.uint8)
-        item['image'] = out
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        for i in range(3):
+            image[:, :, i] = clahe.apply(image[:, :, i])
+
+        item['image'] = image
+
+        # hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        # h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+
+        # bin_yellow = np.logical_and(np.logical_and(h > 15, h < 35), v > 190)
+        # bin_white = np.logical_and(s < 40, v > 200)
+
+        # sobel_x = cv2.Sobel(s, cv2.CV_64F, 1, 0, ksize=15)
+        # sobel_y = cv2.Sobel(s, cv2.CV_64F, 0, 1, ksize=15)
+
+        # grad_min = 0.4 * np.pi/2
+        # grad_max = 0.8 * np.pi/2
+
+        # grad_dir = np.arctan2(np.abs(sobel_y), np.abs(sobel_x))
+        # bin_grad_dir = np.logical_and(grad_dir > grad_min, grad_dir < grad_max)
+
+        # color_bin = np.logical_or(bin_yellow, bin_white)
+        # bin_out = np.logical_and(bin_grad_dir, color_bin)
+
+        # item['image'] = (bin_out * 255).astype(np.uint8)
         self.push(item)
 
 
 class GradientThreshold(Node):
-    def __init__(self, name, mag_limits, dir_limits, kernel_size=5):
+    def __init__(self, name, mag_limits, dir_limits, kernel_size=3):
         super().__init__(name)
         self.kernel_size = kernel_size
         self.mag_limits = mag_limits
@@ -203,6 +225,38 @@ class LaneDetector(Node):
         item['lane_points'] = lane_points
         self.push(item)
 
+class SVMLaneDetector(Node):
+    def im_to_X(self, image):
+        xc, yc = np.meshgrid(range(image.shape[0]), range(image.shape[1]))
+        X = np.stack((image, xc, yc), axis=2)
+        X = np.reshape(X, (-1, 3))
+        X = X[np.where(X[:, 0] > 0), 1:].squeeze()
+        return X
+
+    def draw_classes(self, image, svc):
+        xc, yc = np.meshgrid(range(image.shape[0]), range(image.shape[1]))
+        X = np.stack((xc, yc), axis=2)
+        X = np.reshape(X, (-1, 2))
+        y = svc.predict(X / 255)
+        return np.reshape(y, (image.shape[0], image.shape[1]))
+
+    def process(self, item):
+        item = copy.deepcopy(item)
+        image = item['image']
+        X = self.im_to_X(image)
+        X_half = X[np.where(X[:, 1] > image.shape[0] / 2), :].squeeze()
+        y_half = (X_half[:, 0] > image.shape[1] / 2) * 1
+
+        # np.savez('a.npz', X=X_half, y=y_half)
+        # sys.exit(0)
+
+        svc = LinearSVC()
+        svc.fit(X_half / 255, y_half)
+        print(svc.coef_)
+
+        out = image // 2 + self.draw_classes(image, svc)*127
+        item['image'] = out
+        self.push(item)
 
 class PolyImageLog(Node):
     def __init__(self, name, base_dir):
@@ -329,8 +383,8 @@ def main():
 
     input_dir = 'test_images'
     persp_src_points = [[137.9, 719], [558.3, 426.7], [674.9, 426.7], [1140.2, 719]]
-    persp_dst_points = [[137.9/1280*256, 265], [137.9/1280*256, 0], [1140.2/1280*256, 0], [1140.2/1280*256, 265]]
-    # persp_dst_points = [[10, 265], [10, 0], [245, 0], [245, 265]]
+    # persp_dst_points = [[137.9/1280*256, 270], [137.9/1280*256, 0], [1140.2/1280*256, 0], [1140.2/1280*256, 270]]
+    persp_dst_points = [[30, 270], [30, 0], [225, 0], [225, 270]]
     persp_dst_size = [256, 256]
 
     forward_warp = PerspectiveWarp('perspective_warp', 
@@ -345,54 +399,49 @@ def main():
     rough_lane_detector = LaneDetector('lane_detector_rough')
     finer_lane_detector = LaneDetector('lane_detector_finer', use_argmax_for_center_detect=False)
 
-    pipe = Pipeline(ImageLog('original', 'output_images')
-        | Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size']) | ImageLog('undistorted', 'output_images')
-        | [
-            [
-                ColorThreshold('color_threshold', 80, 200) | ImageLog('color_threshold_log', 'output_images'),
-                GradientThreshold('gradient_threshold', [15, 250], [0.3, 0.9]) | ImageLog('gradient_threshold_log', 'output_images')
-            ]
-            | Merger('max_merger', 'max') | ImageLog('max_merger_out', 'output_images')
-            | forward_warp | ImageLog('perspective_warp_out', 'output_images')
-            | rough_lane_detector | PolyImageLog('poly_log', 'output_images')
-            | MaskWithPoly('mask_with_poly') | ImageLog('mask_with_poly_out', 'output_images')
-            | finer_lane_detector | PolyImageLog('poly_refined_log', 'output_images')
-            | LanePainter('lane_painter') | PolyImageLog('lane_painter_log', 'output_images')
-            | backward_warp | ImageLog('perspective_back_warp_out', 'output_images')
-            | InfoPainter('info_painter', 188) | ImageLog('info_painter_out', 'output_images')
-            ,
-            Bypass('undist_bypass')
-        ]
-        | Merger('add_merger', 'add') | ImageLog('final_image', 'output_images')
-    )
-
-    # pipe = Pipeline(
-    #     Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size'])
+    # pipe = Pipeline(ImageLog('original', 'output_images')
+    #     | Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size']) | ImageLog('undistorted', 'output_images')
     #     | [
     #         [
-    #             ColorThreshold('color_threshold', 80, 200),
-    #             GradientThreshold('gradient_threshold', [50, 250], [0.3, 0.9])
+    #             ColorThreshold('color_threshold', 80, 200) ,#| ImageLog('color_threshold_log', 'output_images'),
+    #             GradientThreshold('gradient_threshold', [25, 100], [0.4, 0.8]) #| ImageLog('gradient_threshold_log', 'output_images')
     #         ]
-    #         | Merger('max_merger', 'max')
-    #         | forward_warp
-    #         | rough_lane_detector
-    #         | MaskWithPoly('mask_with_poly')
-    #         | finer_lane_detector
-    #         | LanePainter('lane_painter')
-    #         | backward_warp
-    #         | InfoPainter('info_painter', 188)
+    #         | Merger('max_merger', 'max')# | ImageLog('max_merger_out', 'output_images')
+    #         | forward_warp #| ImageLog('perspective_warp_out', 'output_images')
+    #         | SVMLaneDetector('svm_lanes') | ImageLog('poly_log', 'output_images')
+    #         # | LanePainter('lane_painter') | PolyImageLog('lane_painter_log', 'output_images')
+    #         | backward_warp #| ImageLog('perspective_back_warp_out', 'output_images')
+    #         # | InfoPainter('info_painter', 188) | ImageLog('info_painter_out', 'output_images')
     #         ,
     #         Bypass('undist_bypass')
     #     ]
-    #     | Merger('add_merger', 'add') | ImageLog('final_image', 'output_images')
+    #     # | Merger('add_merger', 'add') | ImageLog('final_image', 'output_images')
     # )
+
+    pipe = Pipeline(
+        Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size'])
+        | ColorThreshold('color_threshold', 80, 200)
+        | ImageLog('color_threshold_log', 'output_images')
+        # | GradientThreshold('gradient_threshold', [25, 255], [0.4, 0.8])
+        # | forward_warp | ImageLog('perspective_warp_out', 'output_images')
+        # | LaneDetector('lane_detector')
+        # | LanePainter('lane_painter') | PolyImageLog('lane_painter_log', 'output_images')
+            # | backward_warp
+            # | InfoPainter('info_painter', 188)
+            # | ImageLog('color_threshold_log', 'output_images'),
+            # Bypass('undist_bypass')
+        # ]
+        # | Merger('add_merger', 'add') | ImageLog('final_image', 'output_images')
+    )
 
     print(pipe)
 
     # images = collect_images(input_dir)
     # pipe.consume(tqdm(image_loader(images), total=len(images)))
 
-    pipe.consume(tqdm(video_loader('challenge_video.mp4')))
+    pipe.consume(tqdm(video_loader('project_video.mp4')))
+    # pipe.consume(tqdm(video_loader('challenge_video.mp4')))
+    # pipe.consume(tqdm(video_loader('harder_challenge_video.mp4')))
 
 if __name__ == "__main__":
     main()
