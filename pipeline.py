@@ -23,7 +23,7 @@ class ImageLog(Node):
     def process(self, item):
         item = copy.deepcopy(item)
         image, im_id = item['image'], item['id']
-        path = '{}/{}-{}-{:03d}.png'.format(self.base_dir, im_id, self.name, im_id)
+        path = '{}/{:03d}-{}.png'.format(self.base_dir, im_id, self.name)
         cv2.imwrite(path, image)
         self.push(item)
 
@@ -361,9 +361,9 @@ def main():
     print(pipe)
 
     images = collect_images(input_dir)
-    # image_loader(images, pipe)
+    image_loader(images, pipe)
 
-    pipe.consume(tqdm(video_loader('project_video.mp4')))
+    # pipe.consume(tqdm(video_loader('project_video.mp4')))
     # pipe.consume(tqdm(video_loader('challenge_video.mp4')))
     # pipe.consume(tqdm(video_loader('harder_challenge_video.mp4')))
 
