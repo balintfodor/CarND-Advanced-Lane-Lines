@@ -236,11 +236,11 @@ class LanePainter(Node):
         pts = np.array(points, dtype=np.int32)
         cv2.fillPoly(out, [pts], (64))
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(out, '{:0.4f} {:0.4f} {:0.4f}'.format(
-            *p1), (30, 50), font, 0.4, (255, 255, 255), 1)
-        cv2.putText(out, '{:0.4f} {:0.4f} {:0.4f}'.format(
-            *p2), (30, 100), font, 0.4, (255, 255, 255), 1)
+        # font = cv2.FONT_HERSHEY_SIMPLEX
+        # cv2.putText(out, '{:0.4f} {:0.4f} {:0.4f}'.format(
+        #     *p1), (30, 50), font, 0.4, (255, 255, 255), 1)
+        # cv2.putText(out, '{:0.4f} {:0.4f} {:0.4f}'.format(
+        #     *p2), (30, 100), font, 0.4, (255, 255, 255), 1)
         return out
 
     def draw_points(self, im, pts):
@@ -344,17 +344,18 @@ def main():
     backward_warp.inverse = True
 
     pipe = Pipeline(
-        undistort | ImageLog('p01-undistort_img', 'output_images')
+        ImageLog('p00-orig_img', 'output_images')
+        | undistort | ImageLog('p01-undistort_img', 'output_images')
         | [
             LineScoreMap('segment') | ImageLog('p02-line_score_img', 'output_images')
             | forward_warp | ImageLog('p03-warp_img', 'output_images')
             | LaneDetector('detect')
-            | LanePainter('lane_paint') | ImageLog('p05-lane_img', 'output_images')
-            | backward_warp | ImageLog('p06-warp_back_img', 'output_images')
+            | LanePainter('lane_paint') | ImageLog('p04-lane_img', 'output_images')
+            | backward_warp
             | InfoPainter('info_paint', 170, 265),
             Bypass('undistort_bypass')]
         | Add('add')
-        | ImageLog('p07-final', 'output_images')
+        | ImageLog('p05-final', 'output_images')
     )
 
     print(pipe)
