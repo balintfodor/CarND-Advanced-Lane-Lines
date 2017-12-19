@@ -43,11 +43,9 @@ class Undistort(Node):
         self.push(item)
 
 
-class ColorThreshold(Node):
-    def __init__(self, name, sat_th, val_th):
+class SegmentLines(Node):
+    def __init__(self, name):
         super().__init__(name)
-        self.sat_th = sat_th
-        self.val_th = val_th
 
     def process(self, item):
         item = copy.deepcopy(item)
@@ -56,59 +54,30 @@ class ColorThreshold(Node):
         for i in range(3):
             image[:, :, i] = clahe.apply(image[:, :, i])
 
-        item['image'] = image
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
 
-        # hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        # h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+        bin_yellow = np.logical_and(np.logical_and(h > 15, h < 35), v > 190)
+        bin_white = np.logical_and(s < 30, v > 200)
 
-        # bin_yellow = np.logical_and(np.logical_and(h > 15, h < 35), v > 190)
-        # bin_white = np.logical_and(s < 40, v > 200)
+        sobel_x = cv2.Sobel(s, cv2.CV_64F, 1, 0, ksize=15)
+        sobel_y = cv2.Sobel(s, cv2.CV_64F, 0, 1, ksize=15)
 
-        # sobel_x = cv2.Sobel(s, cv2.CV_64F, 1, 0, ksize=15)
-        # sobel_y = cv2.Sobel(s, cv2.CV_64F, 0, 1, ksize=15)
+        dir_min = 0.4 * np.pi/2
+        dir_max = 0.8 * np.pi/2
 
-        # grad_min = 0.4 * np.pi/2
-        # grad_max = 0.8 * np.pi/2
-
-        # grad_dir = np.arctan2(np.abs(sobel_y), np.abs(sobel_x))
-        # bin_grad_dir = np.logical_and(grad_dir > grad_min, grad_dir < grad_max)
-
-        # color_bin = np.logical_or(bin_yellow, bin_white)
-        # bin_out = np.logical_and(bin_grad_dir, color_bin)
-
-        # item['image'] = (bin_out * 255).astype(np.uint8)
-        self.push(item)
-
-
-class GradientThreshold(Node):
-    def __init__(self, name, mag_limits, dir_limits, kernel_size=3):
-        super().__init__(name)
-        self.kernel_size = kernel_size
-        self.mag_limits = mag_limits
-        self.dir_limits = [
-            np.maximum(dir_limits[0], 0) * np.pi/2, 
-            np.minimum(dir_limits[1], 1) * np.pi/2]
-
-    def process(self, item):
-        item = copy.deepcopy(item)
-        im_id, image = item['id'], item['image']
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = image
-        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=self.kernel_size)
-        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=self.kernel_size)
-
+        grad_dir = np.arctan2(np.abs(sobel_y), np.abs(sobel_x))
         grad_mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
         grad_mag = grad_mag / np.max(grad_mag) * 255
 
-        grad_dir = np.arctan2(np.abs(sobel_y), np.abs(sobel_x))
+        bin_grad_dir = np.logical_and(grad_dir > dir_min, grad_dir < dir_max)
+        bin_grad_mag = grad_mag > 5
 
-        bin_image = (grad_mag >= self.mag_limits[0]) * (grad_mag < self.mag_limits[1]) \
-            * (grad_dir >= self.dir_limits[0]) * (grad_dir < self.dir_limits[1])
+        color_bin = np.logical_or(bin_yellow, bin_white)
+        bin_grad = np.logical_and(bin_grad_dir, bin_grad_mag)
+        bin_out = np.logical_and(bin_grad, color_bin)
 
-        out = (bin_image * 255).astype(np.uint8)
-        item['image'] = out
+        item['image'] = (bin_out * 255).astype(np.uint8)
         self.push(item)
 
 
@@ -153,8 +122,8 @@ def quadratic(coeffs, x):
     return coeffs[0] * x*x + coeffs[1] * x + coeffs[2]
 
 class LaneDetector(Node):
-    def __init__(self, name, win_height=32, overlap_param=4, use_argmax_for_center_detect=True):
-        super().__init__(name)
+    def __init__(self, name, win_height=16, overlap_param=1, use_argmax_for_center_detect=True):
+        super().__init__(name)x§
         self.win_height = win_height
         self.use_argmax = use_argmax_for_center_detect
         self.overlap_param = int(overlap_param)
@@ -168,7 +137,7 @@ class LaneDetector(Node):
             mask[b:e] = 1
             vert_sum *= mask
         s = np.sum(vert_sum)
-        if s < self.win_height * 2 * 255:
+        if s < 10e-6:
             return None
 
         if self.use_argmax:
@@ -180,22 +149,24 @@ class LaneDetector(Node):
         return x
 
     def robust_poly_pair_fit(self, points1, points2):
-        points1 = np.array(points1)
-        points2 = np.array(points2)
-        # points = np.vstack((points1, points2))
+        pass
+        # points1 = np.array(points1)
+        # points2 = np.array(points2)
+        # # points = np.vstack((points1, points2))
 
-        def f(p, x, y):
-            e1 = quadratic(p[[0, 1, 2]], x) - y
-            return e1
+        # def f(p, x, y):
+        #     e1 = quadratic(p[[0, 1, 2]], x) - y
+        #     e2 = quadratic(p[[0, 3, 4]], x) - y
+        #     return np.minimum(np.abs(e1), np.abs(e2))
         
-        p0 = np.array([1, 1, 1])
-        res1 = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
-            args=(points1[:, 0], points1[:, 1]))
+        # p0 = np.array([1, 1, 1, 0, 0])
+        # res = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
+        #     args=(points1[:, 0], points1[:, 1]))
 
-        res2 = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
-            args=(points2[:, 0], points2[:, 1]))
+        # res2 = least_squares(f, p0, loss='soft_l1', f_scale=0.1,
+        #     args=(points2[:, 0], points2[:, 1]))
 
-        return ([res1.x[0], res1.x[1], res1.x[2]], [res2.x[0], res2.x[1], res2.x[2]])
+        # return ([res1.x[0], res1.x[1], res1.x[2]], [res2.x[0], res2.x[1], res2.x[2]])
 
     def process(self, item):
         item = copy.deepcopy(item)
@@ -219,9 +190,9 @@ class LaneDetector(Node):
                     last_x = x
             lane_points[k] = points
 
-        lanes = self.robust_poly_pair_fit(lane_points[0], lane_points[1])
+        # lanes = self.robust_poly_pair_fit(lane_points[0], lane_points[1])
 
-        item['lanes'] = lanes
+        # item['lanes'] = lanes
         item['lane_points'] = lane_points
         self.push(item)
 
@@ -265,11 +236,13 @@ class PolyImageLog(Node):
 
     def process(self, item):
         item = copy.deepcopy(item)
-        im_id, image, lanes, lane_points = item['id'], item['image'], item['lanes'], item['lane_points']
+        # im_id, image, lanes, lane_points = item['id'], item['image'], item['lanes'], item['lane_points']
+        im_id, image, lane_points = item['id'], item['image'], item['lane_points']
         samples = range(image.shape[0])
         out = np.copy(image) // 2
+        lanes = [None, None]
         for k, poly in enumerate(lanes):
-            self.draw_poly(out, poly, samples)
+            # self.draw_poly(out, poly, samples)
             for y, x in lane_points[k]:
                 cv2.circle(out, (int(x), int(y)), 2, (255,))
 
@@ -420,10 +393,10 @@ def main():
 
     pipe = Pipeline(
         Undistort('undistort', calib['camera_matrix'], calib['distortion_coefs'], calib['image_size'])
-        | ColorThreshold('color_threshold', 80, 200)
-        | ImageLog('color_threshold_log', 'output_images')
-        # | GradientThreshold('gradient_threshold', [25, 255], [0.4, 0.8])
-        # | forward_warp | ImageLog('perspective_warp_out', 'output_images')
+        | SegmentLines('color_threshold')
+        | forward_warp
+        | LaneDetector('lane_detector')
+        | PolyImageLog('lane_painter_log', 'output_images')
         # | LaneDetector('lane_detector')
         # | LanePainter('lane_painter') | PolyImageLog('lane_painter_log', 'output_images')
             # | backward_warp
