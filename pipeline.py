@@ -132,7 +132,7 @@ class PerspectiveWarp(Node):
 class LaneDetector(Node):
     def begin(self):
         self.prev_points = np.zeros(shape=(0, 3))
-        self.p0 = [0, 0, 0, 255]
+        self.p0 = [1, 0, 0, 0, 255]
 
     def end(self):
         pass
@@ -140,7 +140,7 @@ class LaneDetector(Node):
     def generate_window_list(self, im, width, x_offset, height, y_step):
         win_list = []
         offset_list = []
-        for y in range(im.shape[1] - height, 0, -y_step):
+        for y in range(im.shape[0] - height, 0, -y_step):
             win_list.append(im[y:(y + height), x_offset:(x_offset + width)])
             offset_list.append((y, x_offset))
         return win_list, np.array(offset_list)
@@ -164,53 +164,82 @@ class LaneDetector(Node):
     def fit_quadratic(self, points_with_weights, p0):
         def f(p, x, y, w):
             e1 = np.polyval(p[[0, 1, 2]], x) - y
-            e2 = np.polyval(p[[0, 1, 3]], x) - y
-            return np.minimum(np.abs(e1), np.abs(e2))
+            e2 = np.polyval(p[[0, 3, 4]], x) - y
+            return np.sqrt(w) * np.minimum(np.abs(e1), np.abs(e2))
 
         pts = points_with_weights
-        result = least_squares(f, p0, args=(pts[:, 0], pts[:, 1], pts[:, 2]), bounds=(
-            [-0.0015, -np.inf, -np.inf, -np.inf], [0.0015, np.inf, np.inf, np.inf]),
-            loss='soft_l1')
+        result = least_squares(f, p0, args=(pts[:, 0], pts[:, 1], pts[:, 2]))
+            # bounds=(
+                # [-0.0015, -np.inf, -np.inf, -np.inf, -np.inf],
+                # [0.0015, np.inf, np.inf, np.inf, np.inf]),
+            # loss='soft_l1', f_scale=0.1)
         return result.x, result.fun
 
-    def process(self, item):
-        item = copy.deepcopy(item)
-        image = item['image']
+    def mask_with_guess(self, im, p):
+        ret = np.copy(im) / 2
+        win_y = 16
+        w2_y = win_y // 2
+        win_x = 32
+        w2_x = win_x // 2
+        for k1, k2 in ((1, 2), (3, 4)):
+            for y in range(0, im.shape[0] - win_y, win_y):
+                x = np.polyval([p[0], p[k1], p[k2]], y + w2_y)
+                c_min = np.maximum(0, int(x - w2_x))
+                c_max = np.minimum(im.shape[1], int(x + w2_x))
+                ret[y:(y + win_y), c_min:c_max] = im[y:(y + win_y), c_min:c_max] * 2
+        return ret
 
-        win_height = 16
-        win_y_step = 16
-        im_half_w = image.shape[1] // 2
-
+    def select_candidates(self, im, win_height=16, win_y_step=16):
+        im_half_w = im.shape[1] // 2
         wl1, ol1 = self.generate_window_list(
-            image, im_half_w, 0, win_height, win_y_step)
+            im, im_half_w, 0, win_height, win_y_step)
         wl2, ol2 = self.generate_window_list(
-            image, im_half_w, im_half_w, win_height, win_y_step)
+            im, im_half_w, im_half_w, win_height, win_y_step)
+
         point_set1 = self.select_points(wl1, ol1)
         point_set2 = self.select_points(wl2, ol2)
 
         points = []
         points.extend(point_set1)
         points.extend(point_set2)
+        points = np.array(points)
+        return points
+
+    def process(self, item):
+        item = copy.deepcopy(item)
+        image = item['image']
+
+        cands_for_guess = self.select_candidates(image[(image.shape[0] // 2):, :])
+        cands_for_guess += [image.shape[0] // 2, 0]
+        cands_for_guess = np.c_[cands_for_guess, np.ones(cands_for_guess.shape[0])]
+        guess, _ = self.fit_quadratic(cands_for_guess, [0, 0, 0, 0, 255])
+
+        image = self.mask_with_guess(image, 0.8 * np.array(guess) + 0.2 * np.array(self.p0))
+        points = self.select_candidates(image)
 
         if len(points) > 4:
             points = np.array(points, ndmin=2)
-            weights = np.floor(points[:, 0] / 64) * 2 + 1
+            weights = np.floor(points[:, 0] / 64) + 1
             points = np.c_[points, weights]
 
-            self.prev_points[:, 2] *= 0.5
             merged_points = np.vstack((points, self.prev_points))
 
             p, residuals = self.fit_quadratic(merged_points, self.p0)
             idx = np.argsort(residuals)
             self.prev_points = merged_points[idx[:(len(idx) // 2)], :]
+            self.prev_points[:, 2] = residuals[idx[:(len(idx) // 2)]]
+            self.prev_points[:, 2] /= np.max(self.prev_points[:, 2])
 
-            lanes = [[p[0], p[1], p[2]], [p[0], p[1], p[3]]]
+            self.p0 = p
+
+            lanes = [[p[0], p[1], p[2]], [p[0], p[3], p[4]]]
             support_points = merged_points
         else:
             lanes = [[self.p0[0], self.p0[1], self.p0[2]],
-                     [self.p0[0], self.p0[1], self.p0[3]]]
+                     [self.p0[0], self.p0[3], self.p0[4]]]
             support_points = self.prev_points
 
+        item['image'] = image
         item['lanes'] = lanes
         item['support_points'] = support_points
 
@@ -343,28 +372,30 @@ def main():
     backward_warp.name = 'warp_back'
     backward_warp.inverse = True
 
+    out_dir = 'tmp'
+
     pipe = Pipeline(
-        ImageLog('p00-orig_img', 'output_images')
-        | undistort | ImageLog('p01-undistort_img', 'output_images')
+        ImageLog('p00-orig_img', out_dir)
+        | undistort | ImageLog('p01-undistort_img', out_dir)
         | [
-            LineScoreMap('segment') | ImageLog('p02-line_score_img', 'output_images')
-            | forward_warp | ImageLog('p03-warp_img', 'output_images')
+            LineScoreMap('segment') | ImageLog('p02-line_score_img', out_dir)
+            | forward_warp | ImageLog('p03-warp_img', out_dir)
             | LaneDetector('detect')
-            | LanePainter('lane_paint') | ImageLog('p04-lane_img', 'output_images')
+            | LanePainter('lane_paint') | ImageLog('p04-lane_img', out_dir)
             | backward_warp
             | InfoPainter('info_paint', 170, 265),
             Bypass('undistort_bypass')]
         | Add('add')
-        | ImageLog('p05-final', 'output_images')
+        | ImageLog('p05-final', out_dir)
     )
 
     print(pipe)
 
     images = collect_images(input_dir)
-    image_loader(images, pipe)
+    # image_loader(images, pipe)
 
     # pipe.consume(tqdm(video_loader('project_video.mp4')))
-    # pipe.consume(tqdm(video_loader('challenge_video.mp4')))
+    pipe.consume(tqdm(video_loader('challenge_video.mp4')))
     # pipe.consume(tqdm(video_loader('harder_challenge_video.mp4')))
 
 
