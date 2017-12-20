@@ -165,7 +165,7 @@ class LaneDetector(Node):
         def f(p, x, y, w):
             e1 = np.polyval(p[[0, 1, 2]], x) - y
             e2 = np.polyval(p[[0, 1, 3]], x) - y
-            return np.minimum(np.abs(e1), np.abs(e2))
+            return np.sqrt(w) * np.minimum(np.abs(e1), np.abs(e2))
 
         pts = points_with_weights
         result = least_squares(f, p0, args=(pts[:, 0], pts[:, 1], pts[:, 2]), bounds=(
